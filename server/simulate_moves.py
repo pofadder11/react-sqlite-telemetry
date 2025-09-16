@@ -6,8 +6,13 @@ Usage:
 Stop with Ctrl+C.
 """
 import os, time, random, sqlite3
+import os
+from dotenv import load_dotenv
 
-DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "fleet.db"))
+# ---- config ----
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", os.path.join(os.path.dirname(__file__), "spacetraders.db"))
 
 def ensure_db():
     with open(os.path.join(os.path.dirname(__file__), "schema.sql"), "r", encoding="utf-8") as f:
