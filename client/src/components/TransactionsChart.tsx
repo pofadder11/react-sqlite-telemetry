@@ -1,5 +1,6 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
+/* ---------------- types ---------------- */
 type TxRow = {
     ts: number; // unix seconds
     waypoint_symbol: string;
@@ -11,52 +12,93 @@ type TxRow = {
     total_price: number;
 };
 type ApiResp = { now: number; since_unix: number; rows: TxRow[] };
+type RangeMode = "full" | "last:6h" | "last:24h" | "last:3d" | "last:7d";
 
-const PAD_LEFT = 56;
+/* ---------------- layout ---------------- */
+const PAD_LEFT = 64;
 const PAD_RIGHT = 16;
-const PAD_TOP = 18;
-const PAD_BOTTOM = 28;
+const PAD_TOP = 24;
+const PAD_BOTTOM = 34;
 
-export default function TransactionsChart({
-    defaultSinceHours = 6,
-    defaultSymbol = "",
-    pollMs = 10000,
-}: {
-    defaultSinceHours?: number;
-    defaultSymbol?: string; // e.g., "FUEL" or "" = all
-    pollMs?: number;
-}) {
+const API_BASE =
+    (import.meta as any)?.env?.VITE_API_BASE?.replace(/\/$/, "") ||
+    "http://localhost:8001";
+
+/* ---------------- component ---------------- */
+export default function TransactionsChart({ pollMs = 10000 }: { pollMs?: number }) {
+    const wrapRef = useRef<HTMLDivElement | null>(null);
     const canvasRef = useRef<HTMLCanvasElement | null>(null);
     const [rows, setRows] = useState<TxRow[]>([]);
-    const [since, setSince] = useState(defaultSinceHours);
-    const [symbol, setSymbol] = useState(defaultSymbol);
+    const [symbol, setSymbol] = useState<string>("");
+    const [range, setRange] = useState<RangeMode>("full");
     const [loading, setLoading] = useState(false);
+    const [symbols, setSymbols] = useState<string[]>([]);
     const hoverRef = useRef<{ x: number; y: number } | null>(null);
+    const [isFullscreen, setIsFullscreen] = useState(false);
 
-    // ----- Fetch -----
-    const fetchData = async () => {
+    // Fullscreen helpers
+    const enterFs = async () => {
+        const el = wrapRef.current!;
+        if (document.fullscreenElement) return;
+        try {
+            await el.requestFullscreen();
+        } catch {
+            // fallback: just stretch with CSS
+            setIsFullscreen(true);
+        }
+    };
+    const exitFs = async () => {
+        if (document.fullscreenElement) {
+            await document.exitFullscreen();
+        }
+        setIsFullscreen(false);
+    };
+    useEffect(() => {
+        const onFs = () => setIsFullscreen(!!document.fullscreenElement);
+        document.addEventListener("fullscreenchange", onFs);
+        return () => document.removeEventListener("fullscreenchange", onFs);
+    }, []);
+
+    // Fetch EVERYTHING; normalize numbers
+    const fetchAll = async () => {
         setLoading(true);
-        const qs = new URLSearchParams({ since_hours: String(since) });
-        if (symbol) qs.set("trade_symbol", symbol);
-        const res = await fetch(`http://localhost:8001/transactions?${qs.toString()}`);
+        const qs = new URLSearchParams();
+        if (symbol.trim()) qs.set("trade_symbol", symbol.trim().toUpperCase());
+        const res = await fetch(`${API_BASE}/transactions?${qs.toString()}`);
         const data: ApiResp = await res.json();
-        setRows((data.rows || []).slice().sort((a, b) => a.ts - b.ts)); // ensure sorted
+        const rowsSan: TxRow[] = (data.rows || []).map((r: any) => ({
+            ...r,
+            ts: Number(r.ts),
+            units: Number(r.units ?? 0),
+            price_per_unit: Number(r.price_per_unit ?? 0),
+            total_price: Number(r.total_price ?? 0),
+            trade_symbol: String(r.trade_symbol || ""),
+            tx_type: String(r.tx_type || ""),
+        }));
+        rowsSan.sort((a, b) => a.ts - b.ts);
+        setRows(rowsSan);
+        // Build available symbols list from all rows regardless of current filter
+        const allRes = await fetch(`${API_BASE}/transactions`);
+        const allData: ApiResp = await allRes.json();
+        const syms = Array.from(
+            new Set((allData.rows || []).map((r: any) => String(r.trade_symbol || "")).filter(Boolean))
+        ).sort();
+        setSymbols(syms);
         setLoading(false);
     };
 
     useEffect(() => {
-        fetchData();
-        const id = setInterval(fetchData, pollMs);
+        fetchAll();
+        const id = setInterval(fetchAll, pollMs);
         return () => clearInterval(id);
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [since, symbol, pollMs]);
+    }, [symbol, pollMs]);
 
-    // ----- Build cumulative series -----
-    // SELL  -> income
-    // PURCHASE -> expense
-    const series = buildCumulative(rows);
+    // Build cumulative (full), then slice/offset for display
+    const modelFull = useMemo(() => buildModel(rows), [rows]);
+    const model = useMemo(() => sliceAndOffset(modelFull, range), [modelFull, range]);
 
-    // ----- Draw -----
+    // Draw
     useEffect(() => {
         const canvas = canvasRef.current!;
         const ctx = canvas.getContext("2d")!;
@@ -70,7 +112,6 @@ export default function TransactionsChart({
             };
         };
         const onLeave = () => (hoverRef.current = null);
-
         canvas.addEventListener("mousemove", onMove);
         canvas.addEventListener("mouseleave", onLeave);
 
@@ -79,39 +120,41 @@ export default function TransactionsChart({
             const wCSS = canvas.clientWidth;
             const hCSS = canvas.clientHeight;
             canvas.width = Math.max(300, wCSS * dpr);
-            canvas.height = Math.max(160, hCSS * dpr);
+            canvas.height = Math.max(220, hCSS * dpr);
             ctx.resetTransform();
             ctx.scale(dpr, dpr);
 
             const w = wCSS, h = hCSS;
             ctx.clearRect(0, 0, w, h);
-            ctx.fillStyle = "#0b0b0b";
-            ctx.fillRect(0, 0, w, h);
+            ctx.fillStyle = "#0b0b0b"; ctx.fillRect(0, 0, w, h);
 
             const x0 = PAD_LEFT, x1 = w - PAD_RIGHT;
             const y0 = PAD_TOP, y1 = h - PAD_BOTTOM;
 
-            // ranges
-            const allTs = series.ts.length ? series.ts : [0, 1];
-            const minX = allTs[0];
-            const maxX = allTs[allTs.length - 1] === minX ? minX + 1 : allTs[allTs.length - 1];
-            const maxY = Math.max(1,
-                (series.income.length ? series.income[series.income.length - 1] : 0),
-                (series.expense.length ? series.expense[series.expense.length - 1] : 0)
-            ) * 1.05;
-            const minY = 0;
+            const ts = model.ts.length ? model.ts : [0, 1];
+            const minX = ts[0];
+            const maxX = ts[ts.length - 1] === minX ? minX + 1 : ts[ts.length - 1];
 
-            const xToPx = (ts: number) =>
-                x0 + ((ts - minX) / (maxX - minX)) * (x1 - x0);
-            const yToPx = (v: number) =>
-                y1 - ((v - minY) / (maxY - minY)) * (y1 - y0);
+            const yVals: number[] = [];
+            yVals.push(...model.totalIncome, ...model.totalExpense, ...model.balance);
+            Object.values(model.perSymbol).forEach(se => {
+                yVals.push(...se.income, ...se.expense);
+            });
+            let yMin = Math.min(0, ...yVals);
+            let yMax = Math.max(1, ...yVals);
+            const spanY = Math.max(1e-9, yMax - yMin);
+            yMin -= 0.05 * spanY;
+            yMax += 0.05 * spanY;
 
-            // grid + axes
-            ctx.strokeStyle = "rgba(255,255,255,0.1)";
+            const xToPx = (t: number) => x0 + ((t - minX) / (maxX - minX)) * (x1 - x0);
+            const yToPx = (v: number) => y1 - ((v - yMin) / (yMax - yMin)) * (y1 - y0);
+
+            // Axes & grid
+            ctx.strokeStyle = "rgba(255,255,255,0.12)";
             ctx.lineWidth = 1;
             ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x0, y1); ctx.lineTo(x1, y1); ctx.stroke();
 
-            // x ticks
+            // X ticks (include ends)
             ctx.fillStyle = "rgba(220,220,220,0.85)";
             ctx.font = "12px system-ui, sans-serif";
             const xTicks = 5;
@@ -122,13 +165,13 @@ export default function TransactionsChart({
                 ctx.beginPath(); ctx.moveTo(px, y0); ctx.lineTo(px, y1); ctx.stroke();
                 const label = fmtTime(t);
                 const m = ctx.measureText(label);
-                ctx.fillText(label, px - m.width / 2, y1 + 16);
+                ctx.fillText(label, px - m.width / 2, y1 + 18);
             }
 
-            // y ticks
+            // Y ticks (include ends)
             const yTicks = 4;
             for (let i = 0; i <= yTicks; i++) {
-                const v = minY + (i / yTicks) * (maxY - minY);
+                const v = yMin + (i / yTicks) * (yMax - yMin);
                 const py = yToPx(v);
                 ctx.strokeStyle = "rgba(255,255,255,0.05)";
                 ctx.beginPath(); ctx.moveTo(x0, py); ctx.lineTo(x1, py); ctx.stroke();
@@ -138,58 +181,54 @@ export default function TransactionsChart({
                 ctx.fillText(label, x0 - 8 - m.width, py + 4);
             }
 
-            // title + legend
-            ctx.fillStyle = "#ddd";
-            ctx.fillText(
-                `Cumulative ${symbol ? `${symbol} ` : ""}Income & Expenses (last ${since}h)`,
-                x0, y0 - 4
-            );
+            // Per-item thin (optional filter)
+            Object.entries(model.perSymbol).forEach(([sym, se]) => {
+                if (symbol && sym !== symbol) return;
+                drawLine(ctx, model.ts, se.income, xToPx, yToPx, "rgba(34,197,94,0.45)", 1);
+                drawLine(ctx, model.ts, se.expense, xToPx, yToPx, "rgba(244,63,94,0.45)", 1);
+            });
 
-            // legend
-            const legY = y0 - 4;
-            drawLegend(ctx, x1 - 180, legY, [
-                { label: "Income (SELL)", color: "#22c55e" },
-                { label: "Expenses (PURCHASE)", color: "#f43f5e" },
-            ]);
+            // Totals (thick)
+            drawLine(ctx, model.ts, model.totalIncome, xToPx, yToPx, "#22c55e", 2.5);
+            drawLine(ctx, model.ts, model.totalExpense, xToPx, yToPx, "#f43f5e", 2.5);
+            drawLine(ctx, model.ts, model.balance, xToPx, yToPx, "#60a5fa", 2.5);
 
-            // lines
-            drawSeriesLine(ctx, series.ts, series.income, xToPx, yToPx, "#22c55e", 2);
-            drawSeriesLine(ctx, series.ts, series.expense, xToPx, yToPx, "#f43f5e", 2);
-
-            // hover: nearest x
+            // Hover line & tooltip
             const hover = hoverRef.current;
-            if (hover && series.ts.length) {
+            if (hover && model.ts.length) {
                 const mx = hover.x / dpr;
-                // invert x -> ts
                 const invTs = (px: number) => minX + ((px - x0) / (x1 - x0)) * (maxX - minX);
                 const targetTs = invTs(mx);
-                const idx = nearestIndex(series.ts, targetTs);
-                const ts = series.ts[idx];
-                const px = xToPx(ts);
-                const incomeVal = series.income[idx] || 0;
-                const expenseVal = series.expense[idx] || 0;
+                const idx = nearestIndex(model.ts, targetTs);
+                const t = model.ts[idx];
+                const px = xToPx(t);
 
-                // vertical line
                 ctx.strokeStyle = "rgba(255,255,255,0.25)";
                 ctx.setLineDash([4, 4]);
                 ctx.beginPath(); ctx.moveTo(px, y0); ctx.lineTo(px, y1); ctx.stroke();
                 ctx.setLineDash([]);
 
-                // tooltip
-                const lines = [
-                    new Date(ts * 1000).toLocaleTimeString(),
-                    `Income:   ${fmtMoney(incomeVal)}`,
-                    `Expenses: ${fmtMoney(expenseVal)}`,
-                    `Net:      ${fmtMoney(incomeVal - expenseVal)}`
+                const lines: string[] = [
+                    new Date(t * 1000).toLocaleString(),
+                    `Total Income:  ${fmtMoney(model.totalIncome[idx] || 0)}`,
+                    `Total Expense: ${fmtMoney(model.totalExpense[idx] || 0)}`,
+                    `Balance:       ${fmtMoney(model.balance[idx] || 0)}`,
                 ];
-                drawTooltip(ctx, Math.min(px + 10, x1 - 180), y0 + 10, lines);
+                if (symbol && model.perSymbol[symbol]) {
+                    lines.push(
+                        `— ${symbol} —`,
+                        `Income:  ${fmtMoney(model.perSymbol[symbol].income[idx] || 0)}`,
+                        `Expense: ${fmtMoney(model.perSymbol[symbol].expense[idx] || 0)}`
+                    );
+                }
+                drawTooltip(ctx, Math.min(px + 10, x1 - 220), y0 + 10, lines);
             }
 
             if (loading) {
                 ctx.fillStyle = "rgba(255,255,255,0.7)";
                 const msg = "loading…";
                 const m = ctx.measureText(msg);
-                ctx.fillText(msg, x1 - m.width, y0 + 14);
+                ctx.fillText(msg, x1 - m.width, y0 + 16);
             }
 
             raf = requestAnimationFrame(draw);
@@ -201,69 +240,199 @@ export default function TransactionsChart({
             canvas.removeEventListener("mousemove", onMove);
             canvas.removeEventListener("mouseleave", onLeave);
         };
-    }, [rows, since, symbol, loading, series]);
+    }, [model, range, symbol, loading]);
 
     return (
-        <div style={{ position: "relative", width: "100%", height: 260, background: "black", border: "1px solid #222", borderRadius: 8 }}>
-            <div style={{ position: "absolute", top: 8, left: 10, display: "flex", gap: 8, alignItems: "center", fontSize: 12, color: "#ddd", zIndex: 1 }}>
-                <label>Symbol:</label>
-                <input
-                    placeholder="e.g. FUEL (blank=all)"
-                    value={symbol}
-                    onChange={(e) => setSymbol(e.target.value.trim().toUpperCase())}
-                    style={{ background: "#111", color: "#ddd", border: "1px solid #333", borderRadius: 6, padding: "4px 6px", width: 120 }}
-                />
-                <label>Window (h):</label>
-                <input
-                    type="number"
-                    min={1}
-                    max={24 * 30}
-                    value={since}
-                    onChange={(e) => setSince(Math.max(1, Math.min(24 * 30, Number(e.target.value || 1))))}
-                    style={{ background: "#111", color: "#ddd", border: "1px solid #333", borderRadius: 6, padding: "4px 6px", width: 70 }}
-                />
-                <button onClick={fetchData} style={{ background: "#1f2937", color: "#fff", border: "1px solid #374151", borderRadius: 6, padding: "4px 8px" }}>
-                    Refresh
-                </button>
+        <div
+            ref={wrapRef}
+            style={{
+                position: "relative",
+                width: "100%",
+                height: isFullscreen ? "100vh" : 260,
+                background: "black",
+                border: "1px solid #222",
+                borderRadius: 8,
+                zIndex: isFullscreen ? 9999 : "auto",
+            }}
+        >
+            {/* Controls (HTML legend + filters) */}
+            <div
+                style={{
+                    position: "absolute",
+                    top: 8,
+                    left: 10,
+                    right: 10,
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    alignItems: "center",
+                    fontSize: 12,
+                    color: "#ddd",
+                    zIndex: 2,
+                }}
+            >
+                <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                    <LegendSwatch color="#22c55e" label="Total Income" thick />
+                    <LegendSwatch color="#f43f5e" label="Total Expense" thick />
+                    <LegendSwatch color="#60a5fa" label="Balance" thick />
+                    <LegendSwatch color="rgba(34,197,94,0.45)" label="Per-item Income" />
+                    <LegendSwatch color="rgba(244,63,94,0.45)" label="Per-item Expense" />
+                </div>
+
+                <div style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+                    <label>Symbol:</label>
+                    <select
+                        value={symbol}
+                        onChange={(e) => setSymbol(e.target.value)}
+                        style={{ background: "#111", color: "#ddd", border: "1px solid #333", borderRadius: 6, padding: "4px 6px", minWidth: 120 }}
+                    >
+                        <option value="">All</option>
+                        {symbols.map((s) => (
+                            <option key={s} value={s}>{s}</option>
+                        ))}
+                    </select>
+
+                    <label>Range:</label>
+                    <select
+                        value={range}
+                        onChange={(e) => setRange(e.target.value as RangeMode)}
+                        style={{ background: "#111", color: "#ddd", border: "1px solid #333", borderRadius: 6, padding: "4px 6px" }}
+                    >
+                        <option value="full">Full</option>
+                        <option value="last:6h">Last 6h</option>
+                        <option value="last:24h">Last 24h</option>
+                        <option value="last:3d">Last 3d</option>
+                        <option value="last:7d">Last 7d</option>
+                    </select>
+
+                    {!isFullscreen ? (
+                        <button onClick={enterFs} style={btnStyle}>Full-screen</button>
+                    ) : (
+                        <button onClick={exitFs} style={btnStyle}>Exit</button>
+                    )}
+                    <button onClick={fetchAll} style={btnStyle}>Refresh</button>
+                </div>
             </div>
+
             <canvas ref={canvasRef} style={{ width: "100%", height: "100%", display: "block" }} />
         </div>
     );
 }
 
-/* -------- Helpers -------- */
-
-function buildCumulative(rows: TxRow[]): { ts: number[]; income: number[]; expense: number[] } {
-    const ts: number[] = [];
-    const income: number[] = [];
-    const expense: number[] = [];
-
-    let cumIn = 0;
-    let cumEx = 0;
-
-    // Combine rows with the same timestamp by summing into the same step
-    let i = 0;
-    while (i < rows.length) {
-        const t = rows[i].ts;
-        let deltaIn = 0;
-        let deltaEx = 0;
-        while (i < rows.length && rows[i].ts === t) {
-            const r = rows[i];
-            if (r.tx_type === "SELL") deltaIn += r.total_price;
-            else if (r.tx_type === "PURCHASE") deltaEx += r.total_price;
-            i++;
-        }
-        cumIn += deltaIn;
-        cumEx += deltaEx;
-        ts.push(t);
-        income.push(cumIn);
-        expense.push(cumEx);
-    }
-
-    return { ts, income, expense };
+/* ---------------- helpers ---------------- */
+function LegendSwatch({ color, label, thick = false }: { color: string; label: string; thick?: boolean }) {
+    return (
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+            <span style={{ width: thick ? 26 : 18, height: thick ? 4 : 3, background: color, borderRadius: 2 }} />
+            <span>{label}</span>
+        </span>
+    );
 }
 
-function drawSeriesLine(
+const btnStyle: React.CSSProperties = {
+    background: "#1f2937",
+    color: "#fff",
+    border: "1px solid #374151",
+    borderRadius: 6,
+    padding: "4px 8px",
+};
+
+function buildModel(rows: TxRow[]) {
+    if (!rows.length) return { ts: [] as number[], perSymbol: {} as any, totalIncome: [] as number[], totalExpense: [] as number[], balance: [] as number[] };
+
+    const deltasIn: Record<number, Record<string, number>> = {};
+    const deltasEx: Record<number, Record<string, number>> = {};
+    const symbols = new Set<string>();
+    rows.forEach((r) => {
+        const t = Number(r.ts);
+        const sym = String(r.trade_symbol);
+        const amt = Number(r.total_price) || 0;
+        if (!Number.isFinite(t) || !Number.isFinite(amt)) return;
+        symbols.add(sym);
+        if (String(r.tx_type).toUpperCase() === "SELL") {
+            (deltasIn[t] ||= {});
+            deltasIn[t][sym] = (Number(deltasIn[t][sym]) || 0) + amt;
+        } else if (String(r.tx_type).toUpperCase() === "PURCHASE") {
+            (deltasEx[t] ||= {});
+            deltasEx[t][sym] = (Number(deltasEx[t][sym]) || 0) + amt;
+        }
+    });
+
+    const ts = Array.from(new Set([...Object.keys(deltasIn), ...Object.keys(deltasEx)].map(Number))).sort((a, b) => a - b);
+    const perSymbol: Record<string, { income: number[]; expense: number[] }> = {};
+    Array.from(symbols).forEach((s) => (perSymbol[s] = { income: new Array(ts.length).fill(0), expense: new Array(ts.length).fill(0) }));
+
+    const totalIncome = new Array(ts.length).fill(0);
+    const totalExpense = new Array(ts.length).fill(0);
+    const balance = new Array(ts.length).fill(0);
+
+    const runIn: Record<string, number> = {};
+    const runEx: Record<string, number> = {};
+    let rin = 0,
+        rex = 0;
+
+    ts.forEach((t, i) => {
+        const addIn = deltasIn[t] || {};
+        const addEx = deltasEx[t] || {};
+        Object.entries(addIn).forEach(([s, v]) => {
+            runIn[s] = (runIn[s] || 0) + Number(v || 0);
+            rin += Number(v || 0);
+        });
+        Object.entries(addEx).forEach(([s, v]) => {
+            runEx[s] = (runEx[s] || 0) + Number(v || 0);
+            rex += Number(v || 0);
+        });
+
+        Object.keys(perSymbol).forEach((s) => {
+            perSymbol[s].income[i] = runIn[s] || 0;
+            perSymbol[s].expense[i] = runEx[s] || 0;
+        });
+
+        totalIncome[i] = rin;
+        totalExpense[i] = rex;
+        balance[i] = rin - rex;
+    });
+
+    return { ts, perSymbol, totalIncome, totalExpense, balance };
+}
+
+function sliceAndOffset(model: ReturnType<typeof buildModel>, range: RangeMode) {
+    const { ts } = model;
+    if (!ts.length || range === "full") return model;
+
+    const lastTs = ts[ts.length - 1];
+    const seconds =
+        range === "last:6h" ? 6 * 3600 :
+            range === "last:24h" ? 24 * 3600 :
+                range === "last:3d" ? 3 * 86400 :
+                    range === "last:7d" ? 7 * 86400 : 24 * 3600;
+
+    const start = lastTs - seconds;
+    let i0 = 0;
+    while (i0 < ts.length && ts[i0] < start) i0++;
+    if (i0 === 0) return model;
+
+    const cut = (arr: number[]) => {
+        const base = arr[i0 - 1];
+        return arr.slice(i0 - 1).map((v) => v - base);
+    };
+    const outTs = ts.slice(i0 - 1);
+
+    const perSymbol: Record<string, { income: number[]; expense: number[] }> = {};
+    Object.entries(model.perSymbol).forEach(([k, se]) => {
+        perSymbol[k] = { income: cut(se.income), expense: cut(se.expense) };
+    });
+
+    return {
+        ts: outTs,
+        perSymbol,
+        totalIncome: cut(model.totalIncome),
+        totalExpense: cut(model.totalExpense),
+        balance: cut(model.balance),
+    };
+}
+
+function drawLine(
     ctx: CanvasRenderingContext2D,
     xs: number[],
     ys: number[],
@@ -277,60 +446,26 @@ function drawSeriesLine(
     ctx.strokeStyle = color;
     ctx.beginPath();
     ctx.moveTo(xToPx(xs[0]), yToPx(ys[0]));
-    for (let i = 1; i < xs.length; i++) {
-        ctx.lineTo(xToPx(xs[i]), yToPx(ys[i]));
-    }
+    for (let i = 1; i < xs.length; i++) ctx.lineTo(xToPx(xs[i]), yToPx(ys[i]));
     ctx.stroke();
-
-    // end cap dot
-    const px = xToPx(xs[xs.length - 1]);
-    const py = yToPx(ys[ys.length - 1]);
-    ctx.beginPath();
-    ctx.arc(px, py, 3, 0, Math.PI * 2);
-    ctx.fillStyle = color;
-    ctx.fill();
-}
-
-function drawLegend(
-    ctx: CanvasRenderingContext2D,
-    x: number,
-    y: number,
-    items: { label: string; color: string }[]
-) {
-    let cx = x;
-    items.forEach((it, idx) => {
-        ctx.fillStyle = it.color;
-        ctx.fillRect(cx, y - 10, 18, 3);
-        cx += 24;
-        ctx.fillStyle = "#ccc";
-        ctx.fillText(it.label, cx, y);
-        cx += ctx.measureText(it.label).width + 16;
-    });
 }
 
 function drawTooltip(ctx: CanvasRenderingContext2D, x: number, y: number, lines: string[]) {
     const pad = 6;
     ctx.font = "12px system-ui, sans-serif";
-    const w = Math.max(...lines.map(s => ctx.measureText(s).width)) + pad * 2;
+    const w = Math.max(...lines.map((s) => ctx.measureText(s).width)) + pad * 2;
     const h = lines.length * 16 + pad * 2;
-
-    ctx.fillStyle = "rgba(20,20,20,0.95)";
-    ctx.fillRect(x, y, w, h);
-    ctx.strokeStyle = "rgba(255,255,255,0.15)";
-    ctx.strokeRect(x, y, w, h);
-
-    ctx.fillStyle = "#eee";
-    lines.forEach((s, i) => ctx.fillText(s, x + pad, y + pad + 12 + i * 16));
+    ctx.fillStyle = "rgba(20,20,20,0.95)"; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = "rgba(255,255,255,0.15)"; ctx.strokeRect(x, y, w, h);
+    ctx.fillStyle = "#eee"; lines.forEach((s, i) => ctx.fillText(s, x + pad, y + pad + 12 + i * 16));
 }
 
 function nearestIndex(xs: number[], x: number): number {
     if (!xs.length) return 0;
-    // binary search
     let lo = 0, hi = xs.length - 1;
     while (lo < hi) {
         const mid = (lo + hi) >> 1;
-        if (xs[mid] < x) lo = mid + 1;
-        else hi = mid;
+        if (xs[mid] < x) lo = mid + 1; else hi = mid;
     }
     if (lo > 0 && Math.abs(xs[lo] - x) > Math.abs(xs[lo - 1] - x)) return lo - 1;
     return lo;
@@ -341,9 +476,11 @@ function fmtTime(ts: number) {
     return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
 }
 function fmtMoney(n: number) {
-    if (!isFinite(n)) return String(n);
-    if (n >= 1000000) return (n / 1000000).toFixed(2) + "M";
-    if (n >= 1000) return (n / 1000).toFixed(1) + "k";
-    if (n >= 10) return n.toFixed(0);
-    return n.toFixed(2);
+    if (!Number.isFinite(n)) return "—";
+    const sign = n < 0 ? "-" : "";
+    n = Math.abs(n);
+    if (n >= 1_000_000) return sign + (n / 1_000_000).toFixed(2) + "M";
+    if (n >= 1000) return sign + (n / 1000).toFixed(1) + "k";
+    if (n >= 10) return sign + n.toFixed(0);
+    return sign + n.toFixed(2);
 }
