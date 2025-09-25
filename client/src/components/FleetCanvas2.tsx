@@ -14,7 +14,7 @@ type JourneyEvt = {
 type Segment = { jid: string; from: Vec; to: Vec; depMs: number; arrMs: number };
 type ShipTrail = { recent: Segment[]; older: Segment[]; active?: Segment };
 type Trails = Map<string, ShipTrail>;
-type Waypoint = { symbol: string; x: number; y: number; is_market: boolean; traits?: string[]; };
+type Waypoint = { symbol: string; x: number; y: number; is_market: boolean };
 
 type View = {
     scale: number; tx: number; ty: number; pad: number;
@@ -38,7 +38,7 @@ const ROLE_COLORS: Record<string, string> = {
     HAULER: "#fcfcfcff",
     FIGHTER: "#f43f5e",
     SCOUT: "#a78bfa",
-    GEN: "#fff3a2ff",
+    GEN: "#ffffffff",
 };
 
 const RECENT_LIMIT = 5;
@@ -56,7 +56,7 @@ export default function FleetCanvas() {
     const waypointsRef = useRef<Waypoint[] | null>(null);
     const viewRef = useRef<View | null>(null);
 
-    const [showLabels, setShowLabels] = useState(true);
+    const [showLabels, setShowLabels] = useState(true);   // default ON
     const [mouse, setMouse] = useState<Vec | null>(null);
     const [hoverShip, setHoverShip] = useState<string | null>(null);
     const [wpCount, setWpCount] = useState<number>(0);
@@ -64,10 +64,7 @@ export default function FleetCanvas() {
     // highlight state: symbol -> color
     const [highlightOpen, setHighlightOpen] = useState(false);
     const [highlightFilter, setHighlightFilter] = useState("");
-    const [highlights, setHighlights] = useState<Map<string, string>>(new Map());
-    const [traitHighlights, setTraitHighlights] = useState<Map<string, string>>(new Map());
-    const [traitToAdd, setTraitToAdd] = useState<string>("");
-    const [traitColorToAdd, setTraitColorToAdd] = useState<string>("#ff4d4d");
+    const [highlights, setHighlights] = useState<Map<string, string>>(new Map()); // default color when added: red
 
     // Load waypoints + bbox
     useEffect(() => {
@@ -127,7 +124,7 @@ export default function FleetCanvas() {
         return () => ws.close();
     }, []);
 
-
+    // Transform helpers
     const ensureFit = (w: number, h: number): View => {
         const v = viewRef.current!;
         if (!v) return { scale: 1, tx: 0, ty: 0, pad: 40, minX: -100, maxX: 100, minY: -100, maxY: 100 } as View;
@@ -154,20 +151,20 @@ export default function FleetCanvas() {
         return { x: (p.x - v.tx) / v.scale, y: (p.y - v.ty) / (v.scale * yFlip) };
     };
 
-
+    // Size model that scales with zoom
     function computeSizes(v: View) {
         const base = v.baseScale ?? v.scale;
         const ratio = clamp(v.scale / (base || 1), 0.1, 64);
-        const maxZoomFactor = 20;
+        const maxZoomFactor = 20; // ~16x closer ⇒ “pea sized”
         const t = clamp(Math.log2(ratio) / Math.log2(maxZoomFactor), 0, 1);
-        const wpRadius = Math.max(0.8, lerpN(0.01, 6.0, t));
-        const shipSize = lerpN(3, 4, t);
-        const particleSize = lerpN(0.2, 1.2, t);
-        const haloOuter = wpRadius * 6;
+        const wpRadius = Math.max(0.8, lerpN(0.01, 6.0, t)); // pinprick → pea
+        const shipSize = lerpN(3, 4, t);                   // triangle scale
+        const particleSize = lerpN(0.2, 1.2, t);           // particle px
+        const haloOuter = wpRadius * 6;                    // halo size scales with zoom too
         return { wpRadius, shipSize, particleSize, haloOuter };
     }
 
-
+    // Input: wheel zoom, drag pan, dblclick refit; track mouse for hover
     useEffect(() => {
         const canvas = canvasRef.current!;
         let pointerId: number | null = null;
@@ -226,7 +223,7 @@ export default function FleetCanvas() {
         };
     }, []);
 
-
+    // Render loop
     useEffect(() => {
         const canvas = canvasRef.current!;
         const ctx = canvas.getContext("2d")!;
@@ -243,7 +240,7 @@ export default function FleetCanvas() {
             const view = ensureFit(w, h);
             const { wpRadius, shipSize, particleSize, haloOuter } = computeSizes(view);
 
-
+            // background
             ctx.clearRect(0, 0, w, h);
             ctx.fillStyle = "rgba(255,255,255,0.05)";
             for (let i = 0; i < 60; i++) ctx.fillRect((i * 47) % w, (i * 83) % h, 1, 1);
@@ -251,7 +248,7 @@ export default function FleetCanvas() {
             const wps = waypointsRef.current ?? [];
             ctx.font = "11px system-ui, sans-serif";
 
-
+            // Halos first so points/labels sit atop
             if (highlights.size && wps.length) {
                 for (const wp of wps) {
                     const color = highlights.get(wp.symbol);
@@ -261,27 +258,13 @@ export default function FleetCanvas() {
                 }
             }
 
-            // Trait-based halos (any waypoint whose traits contain a selected trait)
-            if (traitHighlights.size && wps.length) {
-                for (const wp of wps) {
-                    const wpTraits = wp.traits ?? [];
-                    // find first matching trait (simple rule: use first match's color)
-                    const match = wpTraits.find(t => traitHighlights.has(t));
-                    if (!match) continue;
-                    const color = traitHighlights.get(match)!;
-                    const p = worldToScreen({ x: Number(wp.x), y: Number(wp.y) }, w, h);
-                    drawHalo(ctx, p, haloOuter, color);
-                }
-            }
-
-
-
+            // Waypoints (+ labels if toggled)
             for (const wp of wps) {
                 const p = worldToScreen({ x: Number(wp.x), y: Number(wp.y) }, w, h);
-
+                // outer stroke
                 ctx.beginPath(); ctx.arc(p.x, p.y, wpRadius + 0.6, 0, Math.PI * 2);
                 ctx.strokeStyle = "rgba(255,255,255,0.25)"; ctx.lineWidth = 1; ctx.stroke();
-
+                // fill
                 ctx.beginPath(); ctx.arc(p.x, p.y, wpRadius, 0, Math.PI * 2);
                 ctx.fillStyle = wp.is_market ? "#8afc84ff" : "rgba(255,255,255,1)"; ctx.fill();
 
@@ -294,19 +277,19 @@ export default function FleetCanvas() {
             const now = Date.now();
 
             type Nearest = { ship: string; px: number; py: number; d2: number };
-            let best: Nearest | null = null;
+            let best: Nearest | null = null;   // <-- typed and guarded usage
             const mousePx = mouse;
 
-
+            // Trails & ships
             trailsRef.current.forEach((trail, ship) => {
-
+                // older (dim)
                 ctx.lineWidth = 1; ctx.strokeStyle = `rgba(159,231,255,${OLDER_ALPHA})`;
                 for (const seg of trail.older) {
                     const a = worldToScreen(seg.from, w, h);
                     const b = worldToScreen(seg.to, w, h);
                     drawLine(ctx, a, b);
                 }
-
+                // recent graded
                 for (let i = 0; i < trail.recent.length; i++) {
                     const seg = trail.recent[i];
                     const alpha = RECENT_ALPHAS[i] ?? RECENT_ALPHAS[RECENT_ALPHAS.length - 1];
@@ -317,40 +300,40 @@ export default function FleetCanvas() {
                     drawLine(ctx, a, b);
                 }
 
-
+                // linear active
                 const active = trail.recent.find(s => now >= s.depMs && now <= s.arrMs);
                 trail.active = active;
                 if (active) {
-                    const t = (now - active.depMs) / (active.arrMs - active.depMs);
+                    const t = (now - active.depMs) / (active.arrMs - active.depMs); // linear
                     const pos = lerpVec(active.from, active.to, clamp01(t));
                     const prev = lerpVec(active.from, active.to, clamp01(t - 0.002));
                     const p = worldToScreen(pos, w, h);
                     const q = worldToScreen(prev, w, h);
 
-
+                    // direction angle
                     const ang = Math.atan2(p.y - q.y, p.x - q.x);
 
-
+                    // ship color by role
                     const role = SHIP_ROLES[ship] || "GEN";
                     const color = ROLE_COLORS[role] || ROLE_COLORS.GEN;
 
-
+                    // burn particles
                     const fx = (fxByShip.get(ship) || { particles: [] });
                     fxByShip.set(ship, fx);
                     spawnParticles(fx, q, p, 2, particleSize);
                     stepParticles(fx, 1 / 60);
 
-
+                    // draw particles
                     for (const pt of fx.particles) {
                         const alpha = clamp01(pt.life / pt.max);
                         ctx.fillStyle = `rgba(255,255,255,${0.35 * alpha})`;
                         ctx.fillRect(pt.p.x, pt.p.y, particleSize, particleSize);
                     }
 
-
+                    // draw triangle ship (size scales with zoom)
                     drawTriangleShip(ctx, p, ang, color, shipSize);
 
-
+                    // hover detect (update best)
                     if (mousePx) {
                         const dx = mousePx.x - p.x, dy = mousePx.y - p.y;
                         const d2 = dx * dx + dy * dy;
@@ -359,7 +342,7 @@ export default function FleetCanvas() {
                 }
             });
 
-
+            // ship hover label (guard best)
             if (best && best.d2 < 16 * 16) {
                 if (hoverShip !== best.ship) setHoverShip(best.ship);
                 drawTooltip(ctx, best.px + 10, best.py - 6, [best.ship]);
@@ -367,7 +350,7 @@ export default function FleetCanvas() {
                 setHoverShip(null);
             }
 
-
+            // tiny debug banner (helps spot empty /waypoints)
             ctx.font = "11px system-ui, sans-serif";
             ctx.fillStyle = "rgba(255,255,255,0.6)";
             ctx.fillText(`waypoints: ${wpCount}`, 8, 16);
@@ -377,14 +360,14 @@ export default function FleetCanvas() {
 
         raf = requestAnimationFrame(draw);
         return () => cancelAnimationFrame(raf);
-    }, [mouse, showLabels, wpCount, highlights, hoverShip]);
+    }, [mouse, showLabels, wpCount, highlights, hoverShip]); // include hoverShip for clean state updates
 
-
+    // UI handlers for highlight panel
     const toggleHighlight = (sym: string) => {
         setHighlights(prev => {
             const next = new Map(prev);
             if (next.has(sym)) next.delete(sym);
-            else next.set(sym, "#f2f7a3ff");
+            else next.set(sym, "#ff4d4d"); // default color red
             return next;
         });
     };
@@ -396,17 +379,11 @@ export default function FleetCanvas() {
         });
     };
 
-
+    // filtered waypoint symbols for the panel
     const filteredSymbols = (waypointsRef.current ?? [])
         .map(w => w.symbol)
         .filter(s => s.toLowerCase().includes(highlightFilter.toLowerCase()))
         .sort();
-
-    const allTraits = Array.from(
-        new Set(
-            (waypointsRef.current ?? []).flatMap(w => w.traits ?? [])
-        )
-    ).sort();
 
     return (
         <div style={{ width: "100%", height: "100%", position: "relative" }}>
@@ -418,7 +395,7 @@ export default function FleetCanvas() {
             {/* Controls */}
             <div style={{
                 position: "absolute", top: 10, left: 12, display: "flex", gap: 12, alignItems: "center",
-                background: "rgba(0,0,0,0.5)", border: "1px solid #222", borderRadius: 8, padding: "6px 10px", fontSize: 12, color: "#ddd", zIndex: 2
+                background: "rgba(0,0,0,0.5)", border: "1px solid #222", borderRadius: 8, padding: "6px 10px", fontSize: 12, color: "#ddd"
             }}>
                 <label style={{ display: "inline-flex", gap: 6 }}>
                     <input type="checkbox" checked={showLabels} onChange={(e) => setShowLabels(e.target.checked)} />
@@ -433,47 +410,8 @@ export default function FleetCanvas() {
                     {highlightOpen ? "Close" : "Highlight waypoints"}
                 </button>
 
-
-                {allTraits.length > 0 && (
-                    <div style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-                        <span style={{ opacity: 0.8 }}>Trait highlight:</span>
-                        <select
-                            value={traitToAdd}
-                            onChange={(e) => setTraitToAdd(e.target.value)}
-                            style={{ padding: "4px 6px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#151515", color: "#ddd" }}
-                        >
-                            <option value="">— pick trait —</option>
-                            {allTraits.map(t => (
-                                <option key={t} value={t}>{t}</option>
-                            ))}
-                        </select>
-                        <input
-                            type="color"
-                            value={traitColorToAdd}
-                            onChange={(e) => setTraitColorToAdd(e.target.value)}
-                            title="Halo color for this trait"
-                            style={{ width: 28, height: 24 }}
-                        />
-                        <button
-                            onClick={() => {
-                                if (!traitToAdd) return;
-                                setTraitHighlights(prev => {
-                                    const next = new Map(prev);
-                                    next.set(traitToAdd, traitColorToAdd);
-                                    return next;
-                                });
-                            }}
-                            style={{ padding: "4px 8px", borderRadius: 6, border: "1px solid #2a2a2a", background: "#151515", color: "#ddd", cursor: "pointer" }}
-                        >
-                            Add
-                        </button>
-                    </div>
-                )}
-
                 <span style={{ opacity: 0.7 }}>Wheel: zoom • Drag: pan • Double-click: fit</span>
-
             </div>
-
 
             {/* Highlight popover */}
             {highlightOpen && (

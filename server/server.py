@@ -289,12 +289,12 @@ async def send_inflight_snapshot(ws: WebSocket):
             break
 
 
-
 @app.get("/waypoints")
 async def list_waypoints():
     """
-    Returns: [{symbol, x, y, is_market: bool}, ...]
+    Returns: [{symbol, x, y, is_market: bool, traits: [str, ...]}, ...]
     is_market = waypoint has trait_symbol == 'MARKETPLACE'
+    traits    = all trait_symbol values for the waypoint (plus 'MARKET' alias if is_market)
     """
     assert db is not None
     q = """
@@ -304,18 +304,185 @@ async def list_waypoints():
       wr.y,
       EXISTS(
         SELECT 1
-        FROM waypoint_traits wt
-        WHERE wt.waypoint_symbol = wr.symbol
-          AND wt.trait_symbol = 'MARKETPLACE'
-      ) AS is_market
+        FROM waypoint_traits wt2
+        WHERE wt2.waypoint_symbol = wr.symbol
+          AND wt2.trait_symbol = 'MARKETPLACE'
+      ) AS is_market,
+      GROUP_CONCAT(wt.trait_symbol) AS trait_csv
     FROM waypoint_refs wr
+    LEFT JOIN waypoint_traits wt
+      ON wt.waypoint_symbol = wr.symbol
+    GROUP BY wr.symbol, wr.x, wr.y
+    ORDER BY wr.symbol
     """
     async with db.execute(q) as cur:
         rows = await cur.fetchall()
-    return [
-        {"symbol": r[0], "x": r[1], "y": r[2], "is_market": bool(r[3])}
-        for r in rows
-    ]
+
+    out = []
+    for sym, x, y, is_market, trait_csv in rows:
+        # split CSV, dedupe, drop empties
+        traits = [t for t in (trait_csv.split(",") if trait_csv else []) if t]
+        # ensure MARKETPLACE is present when is_market is true
+        if is_market and "MARKETPLACE" not in traits:
+            traits.append("MARKETPLACE")
+        # optional UX-friendly alias
+        if is_market and "MARKET" not in traits:
+            traits.append("MARKET")
+
+        out.append({
+            "symbol": sym,
+            "x": x,
+            "y": y,
+            "is_market": bool(is_market),
+            "traits": sorted(set(traits)),
+        })
+    return out
+
+from typing import Optional
+
+def _to_iso(dt: Optional[str]) -> Optional[str]:
+    return dt
+
+@app.get("/goods/snapshots")
+async def goods_snapshots(
+    trade_symbol: Optional[str] = None,
+    waypoint: Optional[str] = None,
+    limit: int = 500,
+):
+    """
+    One most-recent row per (waypoint, trade_symbol).
+    Sorted by highest sell_price per unit (descending).
+    Optional filters: trade_symbol, waypoint_symbol.
+    """
+    assert db is not None
+
+    # Subquery: find the latest observed_at per (waypoint_symbol, trade_symbol)
+    base = """
+    SELECT mgs.*
+    FROM market_goods_snapshots mgs
+    INNER JOIN (
+        SELECT waypoint_symbol, trade_symbol, MAX(observed_at) AS max_obs
+        FROM market_goods_snapshots
+        GROUP BY waypoint_symbol, trade_symbol
+    ) latest
+      ON mgs.waypoint_symbol = latest.waypoint_symbol
+     AND mgs.trade_symbol    = latest.trade_symbol
+     AND mgs.observed_at     = latest.max_obs
+    """
+
+    where = []
+    params: list = []
+    if trade_symbol:
+        where.append("mgs.trade_symbol = ?"); params.append(trade_symbol)
+    if waypoint:
+        where.append("mgs.waypoint_symbol = ?"); params.append(waypoint)
+    if where:
+        base += " WHERE " + " AND ".join(where)
+
+    # Now order by best unit price (change column if you prefer purchase_price)
+    q = f"""
+    {base}
+    ORDER BY mgs.sell_price DESC
+    LIMIT ?
+    """
+    params.append(limit)
+
+    async with db.execute(q, params) as cur:
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) async for r in cur]
+
+    return rows
+
+
+@app.get("/goods/ohlc")
+async def goods_ohlc(trade_symbol: Optional[str] = None,
+                     waypoint: Optional[str] = None,
+                     start: Optional[str] = None,  # 'YYYY-MM-DD HH:MM:SS'
+                     end: Optional[str] = None,
+                     limit: int = 1000):
+    """
+    OHLC per hour from market_goods_ohlc_hourly; filterable by symbol/waypoint/time.
+    """
+    assert db is not None
+    q = """
+      SELECT waypoint_symbol, trade_symbol, bucket_start,
+             open_buy, high_buy, low_buy, close_buy,
+             open_sell, high_sell, low_sell, close_sell,
+             sample_count
+      FROM market_goods_ohlc_hourly
+    """
+    where = []
+    params: list = []
+    if trade_symbol:
+        where.append("trade_symbol = ?"); params.append(trade_symbol)
+    if waypoint:
+        where.append("waypoint_symbol = ?"); params.append(waypoint)
+    if start:
+        where.append("bucket_start >= ?"); params.append(start)
+    if end:
+        where.append("bucket_start <= ?"); params.append(end)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY bucket_start ASC LIMIT ?"
+    params.append(limit)
+    async with db.execute(q, params) as cur:
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) async for r in cur]
+    return rows
+
+@app.get("/arb/snapshot")
+async def arb_snapshot(trade_symbol: Optional[str] = None, limit: int = 500):
+    """
+    Current arbitrage candidates from trade_arbitrage (delta = sell - buy).
+    Optional filter by trade_symbol.
+    """
+    assert db is not None
+    q = """
+      SELECT trade_symbol, buy_waypoint, buy_price, sell_waypoint, sell_price, delta,
+             buy_observed_at, sell_observed_at, computed_at
+      FROM trade_arbitrage
+    """
+    params: list = []
+    if trade_symbol:
+        q += " WHERE trade_symbol = ?"; params.append(trade_symbol)
+    q += " ORDER BY delta DESC LIMIT ?"
+    params.append(limit)
+    async with db.execute(q, params) as cur:
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) async for r in cur]
+    return rows
+
+@app.get("/arb/history")
+async def arb_history(trade_symbol: Optional[str] = None,
+                      start: Optional[str] = None,
+                      end: Optional[str] = None,
+                      limit: int = 2000):
+    """
+    Time-binned arbitrage deltas from trade_arbitrage_history.
+    """
+    assert db is not None
+    q = """
+      SELECT trade_symbol, buy_waypoint, buy_price, sell_waypoint, sell_price, delta,
+             computed_bucket, computed_at
+      FROM trade_arbitrage_history
+    """
+    where = []
+    params: list = []
+    if trade_symbol:
+        where.append("trade_symbol = ?"); params.append(trade_symbol)
+    if start:
+        where.append("computed_bucket >= ?"); params.append(start)
+    if end:
+        where.append("computed_bucket <= ?"); params.append(end)
+    if where:
+        q += " WHERE " + " AND ".join(where)
+    q += " ORDER BY computed_bucket ASC, trade_symbol ASC LIMIT ?"
+    params.append(limit)
+    async with db.execute(q, params) as cur:
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) async for r in cur]
+    return rows
+
 
 async def broadcast(text: str):
     dead = []
